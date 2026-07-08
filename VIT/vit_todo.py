@@ -2,7 +2,6 @@
 ViT 손코딩 연습용 스켈레톤
 ========================
 각 TODO의 GOAL을 읽고 직접 구현하세요.
-막히면 README.md를 먼저 보고, 그래도 안 되면 vit_reference.py를 참고하세요.
 """
 
 import torch
