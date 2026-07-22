@@ -10,6 +10,7 @@ from torch.nn import Module, ModuleList
 
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+import torch.optim as optm
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +81,7 @@ class Attention(Module):
         self.attend = nn.Softmax(dim=-1) # 하나의 row에 대해 softmax 적용 -> V와 곱연산 후 Result row가 됨
         self.dropout = nn.Dropout(dropout)
         # self.to_out : project_out flag 여부에 따라 W_0 Linear transformation Net 적용
-        self.to_out = nn.Sequential(
+        self.to_out = nn.Sequential( # Linear Projection
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
         )
@@ -106,15 +107,16 @@ class Attention(Module):
         k = qkv[..., self.innerdim:2*self.innerdim]
         v = qkv[..., 2*self.innerdim:]
         # 이제 q, k, v를 head수만큼 분리해야함. d -> d/h 사용
-        B, N, d = q.shape
+        B, N, d = q.shape # q.shape = (B, N, dim)
         h = self.heads
         dh = d // h # dim_head
-        q = q.reshape(B, N, h, dh).transpose(1, 2) # (B, N, d) -> (B, h, N, d/h)
+        q = q.reshape(B, N, h, dh).transpose(1, 2) # (B, N, d) -> (B, N, h, dh) -> (B, h, N, d/h)
         k = k.reshape(B, N, h, dh).transpose(1, 2)
         v = v.reshape(B, N, h, dh).transpose(1, 2)
-        dots = torch.matmul(q, k.transpose(-1, -2)) / self.scale
+        dots = torch.matmul(q, k.transpose(2, 3)) / self.scale
         attn = self.attend(dots) # softmax(QK^T / sqrt(d_k))
-        out = torch.matmul(attn, v)
+        # attn = (B, h, N, N) / V = (B, h, N, d/h)
+        out = torch.matmul(attn, v) # out = (B, h, N, d/h)
         concat_out = out.transpose(1, 2).reshape(B, N, d) # (B, h, N, d/h) -> (B, N, h, d/h) -> (B, N, d)
         return concat_out
 
@@ -159,10 +161,10 @@ class ViT(Module):
         depth, # transformer loop 횟수
         heads, # head 수
         mlp_dim, # FFN hidden dim
+        dropout : float, # dropout rate
         pool='cls', # cls
         channels=3, # RGB
         dim_head=64, # head당 size
-        dropout=0., # dropout rate
         emb_dropout=0., # embedding dropout rate
     ):
         super().__init__()
@@ -192,14 +194,14 @@ class ViT(Module):
 
         # input : (B, C, H, W) -> (B, N, P*P*C)
         self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c i(h p1) (w p2) -> b (h w) (p1 p2 c)'),
+            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = patch_height, p2 = patch_width),
             nn.LayerNorm(patch_dim),
             nn.Linear(patch_dim, dim),
             nn.LayerNorm(dim)
         )
         # nn.LayerNorm() 남발해도 괜찮나?? 의미가있는것?
-        self.cls_token = nn.Parameter(torch.randn(1, num_cls_tokens, dim))
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + num_cls_tokens, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, num_cls_tokens, dim)) # (1, 1, dim)
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + num_cls_tokens, dim)) # (1, N+1, dim)
         self.dropout = nn.Dropout(emb_dropout)
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
         self.pool = pool
@@ -216,15 +218,16 @@ class ViT(Module):
         #   x = cat(cls, patches), + pos_embedding, dropout, transformer
         #   pool → mlp_head
         batch = img.shape[0]
-        x = self.to_patch_embedding(img) # (B, N, dim) patch화 완료
+        x = self.to_patch_embedding(img) # (B, C, H, W) -> (B, h*w, p*p*c) -> (B, N, dim) 
         # 현재 CLS token은 1개만 존재함. Batch마다 동일한 CLS token생성후 합치기
         cls_tokens = self.cls_token # (1, 1, dim)
         cls_tokens = cls_tokens.repeat(batch, 1, 1) # (B, 1, dim)
-        x = torch.cat((cls_tokens, x), dim=1) # (B, 1+N, dim)
-        x += self.pos_embedding # (B, 1+N, dim)
-        x = self.dropout(x)
+        x = torch.cat((cls_tokens, x), dim=1) # (B, 1+N, dim) # 1번축(N축)으로 concat
+        # 순서 중요, cls_tokens + x 형태로 cat하는것, 0 index = cls
+        x += self.pos_embedding # (B, 1+N, dim) + (1, N+1, dim)
+        x = self.dropout(x) # overfitting 방지 
         x = self.transformer(x)
-        # (B, 1+N, dim) -> (B, N+1, dim*3) -> (B, h, N+1, dim/h) -> (B, h, N+1, dim/h) -> (B, N+1, dim)
+        # (B, 1+N, dim) -> (B, N+1, dim*3) -> (B, h, N+1, dim/h)x3 -> (B, h, N+1, dim/h)x3 -> (B, N+1, dim)
         if self.mlp_head is None:
             return x
         x = x[:, 0] # Batch마다 0번 index의 patch 가져오기 = cls token
